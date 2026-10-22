@@ -1,0 +1,97 @@
+name: Move linked issues to In Review
+
+on:
+  pull_request:
+    types: [opened]          # runs only when a PR is opened
+    # Optional: also add ready_for_review if you want drafts treated differently
+
+jobs:
+  move-to-in-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+
+    steps:
+      - name: Move linked issues to In Review
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: sharonlopez2756          # your username
+          PROJECT_NUMBER: 1               # from the project URL
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+        run: |
+          # 1. Get Project ID + Status field ID + "In Review" option ID
+          gh api graphql -f query='
+            query($owner: String!, $number: Int!) {
+              user(login: $owner) {
+                projectV2(number: $number) {
+                  id
+                  fields(first: 20) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f owner=$OWNER -F number=$PROJECT_NUMBER > project.json
+
+          PROJECT_ID=$(jq -r '.data.user.projectV2.id' project.json)
+          STATUS_FIELD_ID=$(jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .id' project.json)
+          IN_REVIEW_OPTION_ID=$(jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="In Review") | .id' project.json)
+
+          echo "PROJECT_ID=$PROJECT_ID"
+          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID"
+          echo "IN_REVIEW_OPTION_ID=$IN_REVIEW_OPTION_ID"
+
+          # 2. Get all issues linked to this PR
+          gh api graphql -f query='
+            query($pr: ID!) {
+              node(id: $pr) {
+                ... on PullRequest {
+                  closingIssuesReferences(first: 20) {
+                    nodes {
+                      id
+                      number
+                      projectItems(first: 10) {
+                        nodes {
+                          id
+                          project { id number }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f pr=$PR_NODE_ID > linked.json
+
+          # 3. For every linked issue that is in our project, set Status = In Review
+          jq -c '.data.node.closingIssuesReferences.nodes[]' linked.json | while read -r issue; do
+            ISSUE_NUMBER=$(echo "$issue" | jq -r '.number')
+            ITEM_ID=$(echo "$issue" | jq -r --arg pid "$PROJECT_ID" '.projectItems.nodes[] | select(.project.id==$pid) | .id')
+
+            if [ -n "$ITEM_ID" ] && [ "$ITEM_ID" != "null" ]; then
+              echo "Updating issue #$ISSUE_NUMBER (item $ITEM_ID) → In Review"
+              gh api graphql -f query='
+                mutation($project:ID!, $item:ID!, $field:ID!, $option:String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project
+                    itemId: $item
+                    fieldId: $field
+                    value: { singleSelectOptionId: $option }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }' \
+                -f project=$PROJECT_ID \
+                -f item=$ITEM_ID \
+                -f field=$STATUS_FIELD_ID \
+                -f option=$IN_REVIEW_OPTION_ID
+            else
+              echo "Issue #$ISSUE_NUMBER is not in project $PROJECT_NUMBER – skipped"
+            fi
+          done
